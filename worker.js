@@ -19,9 +19,16 @@ dotenv.config();
 // ─────────────────────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────────────────────
-const REDIS_CONFIG = process.env.REDIS_TLS === 'true'
-    ? `rediss://${process.env.REDIS_USER}:${process.env.REDIS_PASS}@${process.env.REDIS_HOST}:${process.env.REDIS_PORT}`
-    : `redis://${process.env.REDIS_USER}:${process.env.REDIS_PASS}@${process.env.REDIS_HOST}:${process.env.REDIS_PORT}`;
+const REDIS_CONFIG = {
+    host:     process.env.REDIS_HOST,
+    port:     parseInt(process.env.REDIS_PORT),
+    username: process.env.REDIS_USER || 'default',
+    password: process.env.REDIS_PASS,
+    tls:      process.env.REDIS_TLS === 'true' ? {
+        rejectUnauthorized: false,
+        servername: process.env.REDIS_HOST,
+    } : undefined,
+};
 
 const DB_CONFIG = {
     host:     process.env.DB_HOST,
