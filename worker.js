@@ -16,13 +16,10 @@ dotenv.config();
 // REDIS CONFIG — Redis Cloud with correct TLS
 // ─────────────────────────────────────────────────────────────
 const REDIS_CONFIG = {
-    host:     process.env.REDIS_HOST,
-    port:     parseInt(process.env.REDIS_PORT || '13906'),
-    username: process.env.REDIS_USER || 'default',
-    password: process.env.REDIS_PASS,
-    tls:      {
-        rejectUnauthorized: false,
-    },
+    host:                 process.env.REDIS_HOST,
+    port:                 parseInt(process.env.REDIS_PORT || '13906'),
+    username:             process.env.REDIS_USER || 'default',
+    password:             process.env.REDIS_PASS,
     maxRetriesPerRequest: null,
     enableReadyCheck:     false,
 };
