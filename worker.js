@@ -12,7 +12,6 @@ import { Worker, Queue, QueueEvents } from 'bullmq';
 import mysql from 'mysql2/promise';
 import axios from 'axios';
 import FormData from 'form-data';
-import { createClient } from 'redis';
 import * as dotenv from 'dotenv';
 
 dotenv.config();
