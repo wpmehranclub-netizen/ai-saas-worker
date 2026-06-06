@@ -24,7 +24,9 @@ const REDIS_CONFIG = {
     port:     parseInt(process.env.REDIS_PORT),
     username: process.env.REDIS_USER || 'default',
     password: process.env.REDIS_PASS,
-    tls:      process.env.REDIS_TLS === 'true' ? {} : undefined,
+    tls:      process.env.REDIS_TLS === 'true' ? {
+        rejectUnauthorized: false,
+    } : undefined,
 };
 
 const DB_CONFIG = {
