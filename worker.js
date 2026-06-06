@@ -24,7 +24,7 @@ const REDIS_CONFIG = {
     port:     parseInt(process.env.REDIS_PORT),
     username: process.env.REDIS_USER || 'default',
     password: process.env.REDIS_PASS,
-    tls:      process.env.REDIS_TLS === 'true' ? {
+    tls:      process.env.REDIS_TLS === 'false' ? {
         rejectUnauthorized: false,
         checkServerIdentity: () => undefined,
     } : undefined,
