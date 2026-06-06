@@ -26,7 +26,10 @@ const REDIS_CONFIG = {
     password: process.env.REDIS_PASS,
     tls:      process.env.REDIS_TLS === 'true' ? {
         rejectUnauthorized: false,
+        checkServerIdentity: () => undefined,
     } : undefined,
+    enableTLSForSentinelMode: false,
+    retryStrategy: (times) => Math.min(times * 500, 5000),
 };
 
 const DB_CONFIG = {
