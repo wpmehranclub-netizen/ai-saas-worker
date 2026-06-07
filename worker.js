@@ -347,20 +347,28 @@ async function processAudioTTS( job ) {
         const taskId = res.task_id || res.data?.task_id;
         if ( ! taskId ) throw new Error( 'No task_id returned' );
 
-        await dbQuery(
-            `UPDATE ${TABLE_QUEUE} SET prediction_id = ?, status = 'processing', updated_at = NOW() WHERE prediction_id = ?`,
-            [taskId, prediction_id]
-        );
-        await dbQuery(
-            `UPDATE ${TABLE_GENERATIONS} SET prediction_id = ?, status = 'processing', updated_at = NOW() WHERE prediction_id = ?`,
-            [taskId, prediction_id]
-        );
+        // Update by queue_row_id (reliable) not prediction_id (may mismatch)
+await dbQuery(
+    `UPDATE ${TABLE_QUEUE} SET prediction_id = ?, status = 'processing', updated_at = NOW() WHERE id = ?`,
+    [taskId, queue_row_id]
+);
+await dbQuery(
+    `UPDATE ${TABLE_GENERATIONS} SET prediction_id = ?, status = 'processing', updated_at = NOW() WHERE queue_id = ?`,
+    [taskId, queue_row_id]
+);
 
         console.log( `[TTS] ✅ Submitted. task_id: ${taskId}` );
 
     } catch ( err ) {
         console.error( `[TTS] ❌ Error: ${err.message}` );
-        await updateQueueRow( prediction_id, { status: 'failed', error_message: err.message } );
+        await dbQuery(
+    `UPDATE ${TABLE_QUEUE} SET status = 'failed', error_message = ?, updated_at = NOW() WHERE id = ?`,
+    [err.message, queue_row_id]
+);
+await dbQuery(
+    `UPDATE ${TABLE_GENERATIONS} SET status = 'failed', updated_at = NOW() WHERE queue_id = ?`,
+    [queue_row_id]
+);
         await dbQuery(
             `UPDATE ${TABLE_GENERATIONS} SET status = 'failed', updated_at = NOW() WHERE prediction_id = ?`,
             [prediction_id]
@@ -488,7 +496,17 @@ async function pollDBFallback( queue ) {
 
         for ( const row of rows ) {
             const payload = JSON.parse( row.payload || '{}' );
-            const jobName = payload.job_type || row.model_slug || 'audio_tts';
+            // Map model_slug to correct job type
+const modelSlugToJobType = {
+    'change-voice': 'audio_change_voice',
+    'dub':          'audio_dub',
+};
+const jobName = payload.job_type 
+    || modelSlugToJobType[row.model_slug] 
+    || (row.model_slug?.startsWith('tts-') ? 'audio_tts' : null)
+    || (row.model_slug?.startsWith('image-') ? 'image_generate' : null)
+    || (row.model_slug?.startsWith('video-') ? 'video_generate' : null)
+    || 'audio_tts';
 
             await dbQuery(
                 `UPDATE ${TABLE_QUEUE} SET status = 'processing', updated_at = NOW() WHERE id = ?`,
@@ -623,7 +641,7 @@ async function start() {
     const queue = new Queue( 'ai-saas-jobs', { connection: REDIS_CONFIG });
     await startDashboard( queue );
 
-    setTimeout( () => pollDBFallback( queue ), 15000 );
+    setTimeout( () => pollDBFallback( queue ), 300000 );
     setInterval( () => pollDBFallback( queue ), 5 * 60 * 1000 );
 
     process.on( 'SIGTERM', async () => {
