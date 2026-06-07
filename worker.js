@@ -2,11 +2,10 @@
  * AI SaaS Queue Worker
  * File: worker.js
  *
- * Future-proof account pool system:
- * - Add new provider: add env vars + add pool config in POOLS
- * - Add new job type: add case in processJob() switch
- * - Automatic account rotation on failure
- * - Redis-based slot tracking (AI33) + sliding window (KIE)
+ * Phase 2 additions:
+ * - decrementCounters() — decrements user + platform + pool counters
+ * - KIE rate limit changed to 18 (safe buffer from 20 limit)
+ * - All processors use decrementCounters() instead of decrementUserCounter()
  */
 
 import { Worker, Queue } from 'bullmq';
@@ -31,11 +30,9 @@ const REDIS_CONFIG = {
 
 // ─────────────────────────────────────────────────────────────
 // ACCOUNT POOLS
-// Adding new provider = add entry here + add env vars
 // ─────────────────────────────────────────────────────────────
 const POOLS = {
 
-    // AI33 Audio — slot-based (max concurrent per account)
     ai33_audio: {
         type:      'slot',
         limit:     parseInt( process.env.AI33_SLOT_LIMIT || '15' ),
@@ -45,7 +42,6 @@ const POOLS = {
         jobTypes:  [ 'audio_tts', 'audio_change_voice', 'audio_dub' ],
     },
 
-    // AI33 Image — slot-based
     ai33_image: {
         type:      'slot',
         limit:     parseInt( process.env.AI33_SLOT_LIMIT || '15' ),
@@ -55,7 +51,6 @@ const POOLS = {
         jobTypes:  [ 'image_generate' ],
     },
 
-    // AI33 Video — slot-based
     ai33_video: {
         type:      'slot',
         limit:     parseInt( process.env.AI33_SLOT_LIMIT || '15' ),
@@ -65,12 +60,12 @@ const POOLS = {
         jobTypes:  [ 'video_generate' ],
     },
 
-    // KIE — rate-based (sliding window: 20 req / 10 seconds per account)
+    // KIE — 18 per 10s (safe buffer below KIE's hard limit of 20)
     kie: {
         type:      'rate',
-        limit:     parseInt( process.env.KIE_RATE_LIMIT  || '20' ),
-        windowMs:  parseInt( process.env.KIE_WINDOW_MS   || '10000' ),
-        accounts:  parseAccounts( process.env.KIE_KEYS   || process.env.KIE_KEY || '' ),
+        limit:     parseInt( process.env.KIE_RATE_LIMIT || '18' ),
+        windowMs:  parseInt( process.env.KIE_WINDOW_MS  || '10000' ),
+        accounts:  parseAccounts( process.env.KIE_KEYS  || process.env.KIE_KEY || '' ),
         baseUrl:   'https://api.kie.ai',
         authStyle: 'bearer',
         jobTypes:  [ 'image_generate', 'video_generate', 'music_generate' ],
@@ -78,7 +73,16 @@ const POOLS = {
 
     // Future providers — add here:
     // replicate: { type: 'slot', limit: 10, accounts: parseAccounts(process.env.REPLICATE_KEYS), ... }
-    // runway:    { type: 'rate', limit: 5, windowMs: 60000, ... }
+};
+
+// Job type → pool name mapping — must match PHP JOB_POOL_MAP
+const JOB_POOL_MAP = {
+    audio_tts:          'audio',
+    audio_change_voice: 'audio',
+    audio_dub:          'audio',
+    image_generate:     'image',
+    video_generate:     'video',
+    music_generate:     'music',
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -103,7 +107,7 @@ const TABLE_CREDITS     = `${TABLE_PREFIX}ais_credits`;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
 // ─────────────────────────────────────────────────────────────
-// PARSE ACCOUNTS — from comma-separated env var
+// PARSE ACCOUNTS
 // ─────────────────────────────────────────────────────────────
 function parseAccounts( input ) {
     if ( ! input ) return [];
@@ -113,7 +117,7 @@ function parseAccounts( input ) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// REDIS CLIENT — for pool management
+// REDIS CLIENT
 // ─────────────────────────────────────────────────────────────
 let redisClient = null;
 
@@ -137,26 +141,20 @@ async function getAvailableAccount( poolName ) {
         if ( ! account.enabled ) continue;
 
         const accountId = account.id;
-
-        // Check if temporarily disabled (401/402 etc)
-        const disabled = await redis.exists( `pool:disabled:${poolName}:${accountId}` );
+        const disabled  = await redis.exists( `pool:disabled:${poolName}:${accountId}` );
         if ( disabled ) continue;
 
         if ( pool.type === 'slot' ) {
-            // Slot-based: atomic increment and check
-            const key     = `pool:slots:${poolName}:${accountId}`;
-            const newVal  = await redis.incr( key );
+            const key    = `pool:slots:${poolName}:${accountId}`;
+            const newVal = await redis.incr( key );
             await redis.expire( key, 3600 );
 
             if ( newVal <= pool.limit ) {
                 return { ...account, pool: poolName };
             }
-
-            // Over limit — release and try next
             await redis.decr( key );
 
         } else if ( pool.type === 'rate' ) {
-            // Rate-based: sliding window
             const key    = `pool:rate:${poolName}:${accountId}`;
             const now    = Date.now();
             const window = pool.windowMs || 10000;
@@ -172,11 +170,11 @@ async function getAvailableAccount( poolName ) {
         }
     }
 
-    return null; // all accounts busy
+    return null;
 }
 
 // ─────────────────────────────────────────────────────────────
-// RELEASE SLOT — call when job completes or fails
+// RELEASE SLOT
 // ─────────────────────────────────────────────────────────────
 async function releaseSlot( poolName, accountId ) {
     const pool = POOLS[ poolName ];
@@ -184,17 +182,46 @@ async function releaseSlot( poolName, accountId ) {
 
     const redis = await getRedis();
     const key   = `pool:slots:${poolName}:${accountId}`;
-    const val   = await redis.get( key );
-    if ( parseInt( val ) > 0 ) await redis.decr( key );
+    const val   = parseInt( await redis.get( key ) ) || 0;
+    if ( val > 0 ) await redis.decr( key );
 }
 
 // ─────────────────────────────────────────────────────────────
-// DISABLE ACCOUNT — on 401/402 response
+// DISABLE ACCOUNT
 // ─────────────────────────────────────────────────────────────
 async function disableAccount( poolName, accountId, seconds = 3600 ) {
     const redis = await getRedis();
     await redis.setex( `pool:disabled:${poolName}:${accountId}`, seconds, 1 );
     console.warn( `[Pool] ⚠️ Disabled: ${poolName}:${accountId} for ${seconds}s` );
+}
+
+// ─────────────────────────────────────────────────────────────
+// DECREMENT ALL COUNTERS — user + platform + pool
+// Call on job complete or fail
+// ─────────────────────────────────────────────────────────────
+async function decrementCounters( userId, jobType ) {
+    try {
+        const redis    = await getRedis();
+        const poolName = JOB_POOL_MAP[ jobType ] || 'general';
+
+        // User counter
+        const userKey = `ai_saas:concurrent:${userId}`;
+        const userVal = parseInt( await redis.get( userKey ) ) || 0;
+        if ( userVal > 0 ) await redis.decr( userKey );
+
+        // Platform counter
+        const platKey = 'ai_saas:platform:total_active';
+        const platVal = parseInt( await redis.get( platKey ) ) || 0;
+        if ( platVal > 0 ) await redis.decr( platKey );
+
+        // Pool counter
+        const poolKey = `ai_saas:pool:${poolName}:active`;
+        const poolVal = parseInt( await redis.get( poolKey ) ) || 0;
+        if ( poolVal > 0 ) await redis.decr( poolKey );
+
+    } catch ( err ) {
+        console.error( '[Counter] Decrement error:', err.message );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -242,17 +269,6 @@ async function refundCredits( predictionId, reason ) {
     }
 }
 
-async function decrementUserCounter( userId ) {
-    try {
-        const redis = await getRedis();
-        const key   = `ai_saas:concurrent:${userId}`;
-        const val   = parseInt( await redis.get( key ) ) || 0;
-        if ( val > 0 ) await redis.decr( key );
-    } catch ( err ) {
-        console.error( '[Counter] Decrement error:', err.message );
-    }
-}
-
 // ─────────────────────────────────────────────────────────────
 // HTTP REQUEST — reusable for any provider
 // ─────────────────────────────────────────────────────────────
@@ -261,7 +277,6 @@ async function providerRequest( poolName, account, endpoint, method = 'POST', da
     const url     = `${pool.baseUrl}${endpoint}`;
     const headers = {};
 
-    // Auth header based on auth style
     if ( pool.authStyle === 'xi-api-key' ) {
         headers['xi-api-key'] = account.key;
     } else if ( pool.authStyle === 'bearer' ) {
@@ -278,18 +293,16 @@ async function providerRequest( poolName, account, endpoint, method = 'POST', da
         method,
         url,
         headers,
-        data:    isFormData ? data : ( data ? JSON.stringify( data ) : undefined ),
-        timeout: 60000,
-        validateStatus: null, // don't throw on non-2xx
+        data:           isFormData ? data : ( data ? JSON.stringify( data ) : undefined ),
+        timeout:        60000,
+        validateStatus: null,
     });
 
-    // Handle auth failures — disable account
     if ( response.status === 401 || response.status === 403 ) {
         await disableAccount( poolName, account.id, 3600 );
         throw new Error( `AUTH_FAILED:${response.status}` );
     }
 
-    // Handle credit exhaustion — disable for 24h
     if ( response.status === 402 ) {
         await disableAccount( poolName, account.id, 86400 );
         throw new Error( `NO_CREDITS:${response.status}` );
@@ -300,7 +313,6 @@ async function providerRequest( poolName, account, endpoint, method = 'POST', da
 
 // ─────────────────────────────────────────────────────────────
 // JOB PROCESSORS
-// Adding new job type = add case in processJob() + new function
 // ─────────────────────────────────────────────────────────────
 
 async function processAudioTTS( job ) {
@@ -315,7 +327,6 @@ async function processAudioTTS( job ) {
 
     try {
         console.log( `[TTS] Processing ${prediction_id} via ${account.id}...` );
-
         await updateQueueRow( prediction_id, { status: 'processing' } );
 
         const res = await providerRequest( 'ai33_audio', account,
@@ -323,11 +334,11 @@ async function processAudioTTS( job ) {
             'POST',
             {
                 text,
-                model_id:                  model_id || 'eleven_multilingual_v2',
-                with_transcript:           false,
-                voice_settings:            voice_settings || {},
-                apply_text_normalization:  'auto',
-                receive_url:               receive_url || WEBHOOK_URL,
+                model_id:                 model_id || 'eleven_multilingual_v2',
+                with_transcript:          false,
+                voice_settings:           voice_settings || {},
+                apply_text_normalization: 'auto',
+                receive_url:              receive_url || WEBHOOK_URL,
             }
         );
 
@@ -336,7 +347,6 @@ async function processAudioTTS( job ) {
         const taskId = res.task_id || res.data?.task_id;
         if ( ! taskId ) throw new Error( 'No task_id returned' );
 
-        // Update DB with real AI33 task_id
         await dbQuery(
             `UPDATE ${TABLE_QUEUE} SET prediction_id = ?, status = 'processing', updated_at = NOW() WHERE prediction_id = ?`,
             [taskId, prediction_id]
@@ -356,7 +366,7 @@ async function processAudioTTS( job ) {
             [prediction_id]
         );
         await refundCredits( prediction_id, `tts_failed: ${err.message}` );
-        await decrementUserCounter( user_id );
+        await decrementCounters( user_id, 'audio_tts' );
         throw err;
     } finally {
         await releaseSlot( 'ai33_audio', account.id );
@@ -365,8 +375,6 @@ async function processAudioTTS( job ) {
 
 async function processImageGenerate( job ) {
     const { prediction_id, user_id, provider, model_id, prompt } = job.data;
-
-    // Use preferred provider or auto-detect
     const poolName = provider || 'ai33_image';
     const account  = await getAvailableAccount( poolName );
     if ( ! account ) throw new Error( `NO_ACCOUNT_AVAILABLE:${poolName}` );
@@ -375,7 +383,6 @@ async function processImageGenerate( job ) {
         console.log( `[Image] Processing ${prediction_id} via ${account.id}...` );
         await updateQueueRow( prediction_id, { status: 'processing' } );
 
-        // Image generation — endpoint varies by model
         const endpoint = job.data.endpoint || '/v1i/task/generate-image';
         const res      = await providerRequest( poolName, account, endpoint, 'POST', job.data.payload || {
             model_id,
@@ -397,7 +404,7 @@ async function processImageGenerate( job ) {
         console.error( `[Image] ❌ Error: ${err.message}` );
         await updateQueueRow( prediction_id, { status: 'failed', error_message: err.message } );
         await refundCredits( prediction_id, `image_failed: ${err.message}` );
-        await decrementUserCounter( user_id );
+        await decrementCounters( user_id, 'image_generate' );
         throw err;
     } finally {
         await releaseSlot( poolName, account.id );
@@ -431,7 +438,7 @@ async function processVideoGenerate( job ) {
         console.error( `[Video] ❌ Error: ${err.message}` );
         await updateQueueRow( prediction_id, { status: 'failed', error_message: err.message } );
         await refundCredits( prediction_id, `video_failed: ${err.message}` );
-        await decrementUserCounter( user_id );
+        await decrementCounters( user_id, 'video_generate' );
         throw err;
     } finally {
         await releaseSlot( poolName, account.id );
@@ -439,8 +446,6 @@ async function processVideoGenerate( job ) {
 }
 
 async function processMusicGenerate( job ) {
-    // Suno via AI33 — uses different auth (Supabase token)
-    // Will be implemented when music page is ready
     console.log( '[Music] Music generation not yet implemented in worker' );
     throw new Error( 'Music generation not yet implemented' );
 }
@@ -521,7 +526,6 @@ async function startDashboard( queue ) {
     const app  = express();
     const port = process.env.PORT || 3000;
 
-    // Basic auth
     app.use( '/dashboard', ( req, res, next ) => {
         const b64    = ( req.headers.authorization || '' ).split( ' ' )[1] || '';
         const [l, p] = Buffer.from( b64, 'base64' ).toString().split( ':' );
@@ -532,7 +536,7 @@ async function startDashboard( queue ) {
 
     app.use( '/dashboard', serverAdapter.getRouter() );
 
-    // Health endpoint — returns pool stats
+    // Health endpoint — returns pool + platform stats
     app.get( '/health', async ( req, res ) => {
         const redis     = await getRedis().catch( () => null );
         const poolStats = {};
@@ -540,7 +544,7 @@ async function startDashboard( queue ) {
         for ( const [poolName, pool] of Object.entries( POOLS ) ) {
             poolStats[poolName] = {
                 accounts: await Promise.all( pool.accounts.map( async acc => {
-                    let slots = 0;
+                    let slots    = 0;
                     let disabled = false;
                     if ( redis ) {
                         disabled = !! await redis.exists( `pool:disabled:${poolName}:${acc.id}` );
@@ -557,7 +561,16 @@ async function startDashboard( queue ) {
             };
         }
 
-        res.json({ status: 'ok', pools: poolStats });
+        // Platform + pool counters
+        const platform = {};
+        if ( redis ) {
+            platform.total_active = parseInt( await redis.get( 'ai_saas:platform:total_active' ) ) || 0;
+            for ( const poolName of ['audio','image','video','music'] ) {
+                platform[`pool_${poolName}`] = parseInt( await redis.get( `ai_saas:pool:${poolName}:active` ) ) || 0;
+            }
+        }
+
+        res.json({ status: 'ok', pools: poolStats, platform });
     });
 
     app.listen( port, () => {
@@ -573,12 +586,10 @@ async function start() {
     console.log( '[Worker] Starting AI SaaS Queue Worker...' );
     console.log( `[Worker] Redis: ${process.env.REDIS_HOST}:${process.env.REDIS_PORT}` );
 
-    // Log pool status
     for ( const [name, pool] of Object.entries( POOLS ) ) {
         console.log( `[Pool] ${name}: ${pool.accounts.length} accounts, type: ${pool.type}, limit: ${pool.limit}` );
     }
 
-    // Test DB
     try {
         await dbQuery( 'SELECT 1' );
         console.log( '[Worker] MySQL connected ✅' );
@@ -587,7 +598,6 @@ async function start() {
         process.exit( 1 );
     }
 
-    // Test Redis
     try {
         const redis = await getRedis();
         await redis.ping();
@@ -613,7 +623,6 @@ async function start() {
     const queue = new Queue( 'ai-saas-jobs', { connection: REDIS_CONFIG });
     await startDashboard( queue );
 
-    // DB fallback polling every 5 minutes
     setTimeout( () => pollDBFallback( queue ), 15000 );
     setInterval( () => pollDBFallback( queue ), 5 * 60 * 1000 );
 
