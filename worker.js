@@ -156,10 +156,8 @@ async function ai33Request(endpoint, method = 'POST', data = null, apiKey, isFor
 // JOB PROCESSORS
 // ─────────────────────────────────────────────────────────────
 async function processTTS(job) {
-    const {
-        prediction_id, voice_id, text, model_id,
-        output_format, voice_settings
-    } = job.data;
+    const { prediction_id, queue_row_id, user_id, voice_id, text, model_id, 
+        output_format, voice_settings, receive_url } = job.data;
 
     const account = getAvailableAccount();
     incrementAccount(account.key);
@@ -178,7 +176,7 @@ async function processTTS(job) {
                 with_transcript:          false,
                 voice_settings:           voice_settings || {},
                 apply_text_normalization: 'auto',
-                receive_url:              WEBHOOK_URL,
+                receive_url:              receive_url || WEBHOOK_URL,
             },
             account.key
         );
