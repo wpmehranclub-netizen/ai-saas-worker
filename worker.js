@@ -201,23 +201,13 @@ async function disableAccount( poolName, accountId, seconds = 3600 ) {
 // ─────────────────────────────────────────────────────────────
 async function decrementCounters( userId, jobType ) {
     try {
-        const redis    = await getRedis();
-        const poolName = JOB_POOL_MAP[ jobType ] || 'general';
+        const redis = await getRedis();
 
-        // User counter
+        // Worker only decrements user counter
+        // Platform + pool are decremented by PHP webhook handler
         const userKey = `ai_saas:concurrent:${userId}`;
         const userVal = parseInt( await redis.get( userKey ) ) || 0;
         if ( userVal > 0 ) await redis.decr( userKey );
-
-        // Platform counter
-        const platKey = 'ai_saas:platform:total_active';
-        const platVal = parseInt( await redis.get( platKey ) ) || 0;
-        if ( platVal > 0 ) await redis.decr( platKey );
-
-        // Pool counter
-        const poolKey = `ai_saas:pool:${poolName}:active`;
-        const poolVal = parseInt( await redis.get( poolKey ) ) || 0;
-        if ( poolVal > 0 ) await redis.decr( poolKey );
 
     } catch ( err ) {
         console.error( '[Counter] Decrement error:', err.message );
